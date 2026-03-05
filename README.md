@@ -1,11 +1,11 @@
-# ArtaPay Backend
+# Vessel Pay Backend
 
-Backend service for ArtaPay dApp that signs Paymaster data and builds StableSwap
+Backend service for Vessel Pay dApp that signs Paymaster data and builds StableSwap
 calldata for gasless stablecoin transactions on Base Sepolia and Etherlink Shadownet.
 
 ## Overview
 
-ArtaPay Backend provides:
+Vessel Pay Backend provides:
 
 - **Paymaster Signing**: Generates signatures for ERC-4337 paymaster validation
 - **Swap Quotes**: Reads on-chain StableSwap quotes for token conversions
@@ -58,7 +58,7 @@ Reads quotes and encodes swap calldata for StableSwap.
 ## Fee Structure
 
 This backend does not charge fees. On-chain fees are defined in the smart
-contracts (see `artapay-sc`).
+contracts (see `vessel-sc`).
 
 | Fee Type       | Rate          | Paid By | Token      |
 | -------------- | ------------- | ------- | ---------- |
@@ -76,7 +76,7 @@ contracts (see `artapay-sc`).
 
 ```bash
 # From repo root
-cd artapay-be
+cd vessel-be
 
 # Install dependencies
 npm install
@@ -245,7 +245,7 @@ This project uses:
 ### Project Structure
 
 ```
-artapay-be/
+vessel-be/
 |-- src/
 |   |-- index.ts        # API server and signer logic
 |-- .env.example        # Environment template

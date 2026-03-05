@@ -35,6 +35,8 @@ const RPC_URL = process.env.RPC_URL;
 const RPC_URL_ETHERLINK = process.env.RPC_URL_ETHERLINK;
 const STABLE_SWAP_ADDRESS = process.env.STABLE_SWAP_ADDRESS as Address | undefined;
 const STABLE_SWAP_ADDRESS_ETHERLINK = process.env.STABLE_SWAP_ADDRESS_ETHERLINK as Address | undefined;
+const IDRX_TOKEN_ADDRESS = process.env.IDRX_TOKEN_ADDRESS as Address | undefined;
+const IDRX_TOKEN_ADDRESS_ETHERLINK = process.env.IDRX_TOKEN_ADDRESS_ETHERLINK as Address | undefined;
 
 if (!PRIVATE_KEY) {
   console.error("ERROR: PAYMASTER_SIGNER_PRIVATE_KEY not found in .env");
@@ -65,6 +67,7 @@ type ChainConfig = {
   chainId: number;
   rpcUrl?: string;
   stableSwapAddress?: Address;
+  idrxTokenAddress?: Address;
 };
 
 const CHAINS: Record<ChainKey, ChainConfig> = {
@@ -74,6 +77,7 @@ const CHAINS: Record<ChainKey, ChainConfig> = {
     chainId: 84532,
     rpcUrl: RPC_URL,
     stableSwapAddress: STABLE_SWAP_ADDRESS,
+    idrxTokenAddress: IDRX_TOKEN_ADDRESS,
   },
   etherlink_shadownet: {
     key: "etherlink_shadownet",
@@ -81,6 +85,7 @@ const CHAINS: Record<ChainKey, ChainConfig> = {
     chainId: 127823,
     rpcUrl: RPC_URL_ETHERLINK,
     stableSwapAddress: STABLE_SWAP_ADDRESS_ETHERLINK,
+    idrxTokenAddress: IDRX_TOKEN_ADDRESS_ETHERLINK,
   },
 };
 
@@ -144,6 +149,23 @@ const STABLE_SWAP_ABI = [
       { name: "minAmountOut", type: "uint256", internalType: "uint256" },
     ],
     outputs: [{ name: "amountOut", type: "uint256", internalType: "uint256" }],
+  },
+] as const;
+
+/**
+ * MockStableCoin ABI - Used for minting IDRX tokens on testnet
+ * The mint function allows minting tokens to any address
+ */
+const MOCK_STABLECOIN_ABI = [
+  {
+    type: "function",
+    name: "mint",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [],
   },
 ] as const;
 
@@ -397,6 +419,163 @@ app.post("/swap/build", async (req, res) => {
   }
 });
 
+/**
+ * POST /topup-idrx
+ * Body: { walletAddress, amount, chain? }
+ * Mints IDRX tokens to the specified wallet address
+ */
+app.post("/topup-idrx", async (req, res) => {
+  try {
+    const { walletAddress, amount } = req.body;
+
+    // Validate walletAddress is provided and is a valid Ethereum address
+    if (!walletAddress || typeof walletAddress !== "string") {
+      return res.status(400).json({
+        error: "invalid_address",
+        message: "walletAddress is required and must be a string",
+      });
+    }
+
+    // Validate Ethereum address format (0x followed by 40 hex characters)
+    const addressRegex = /^0x[0-9a-fA-F]{40}$/;
+    if (!addressRegex.test(walletAddress)) {
+      return res.status(400).json({
+        error: "invalid_address",
+        message: "walletAddress must be a valid Ethereum address",
+      });
+    }
+
+    // Validate amount is provided
+    if (amount === undefined || amount === null || amount === "") {
+      return res.status(400).json({
+        error: "invalid_amount",
+        message: "amount is required",
+      });
+    }
+
+    // Validate amount is a positive number
+    const amountNum = Number(amount);
+    if (isNaN(amountNum) || amountNum <= 0) {
+      return res.status(400).json({
+        error: "invalid_amount",
+        message: "amount must be a positive number",
+      });
+    }
+
+    // Parse amount to wei units (6 decimals for IDRX)
+    // IDRX uses 6 decimal places, so multiply by 10^6 to convert to smallest unit
+    // Example: 100.50 IDRX → 100,500,000 wei
+    const amountInWei = Math.floor(amountNum * 1_000_000);
+
+    // Validate amount does not exceed maximum safe integer
+    if (amountInWei > Number.MAX_SAFE_INTEGER) {
+      return res.status(400).json({
+        error: "amount_out_of_range",
+        message: "amount exceeds maximum safe integer value",
+      });
+    }
+
+    // Resolve chain context using existing helper
+    // This determines which blockchain network to use (Base Sepolia or Etherlink)
+    // based on the chain parameter in the request body, query string, or header
+    let chainContext;
+    try {
+      chainContext = getChainContext(req);
+    } catch (error) {
+      return res.status(400).json({
+        error: "chain_not_configured",
+        message: error instanceof Error ? error.message : "Chain not configured",
+      });
+    }
+
+    const { chain, publicClient } = chainContext;
+
+    // Validate IDRX token address is configured for this chain
+    if (!chain.idrxTokenAddress) {
+      return res.status(400).json({
+        error: "chain_not_configured",
+        message: `IDRX token address not configured for chain: ${chain.key}`,
+      });
+    }
+
+    console.log("Top-up IDRX request:");
+    console.log(`   Chain: ${chain.name} (${chain.chainId})`);
+    console.log(`   Wallet: ${walletAddress}`);
+    console.log(`   Amount: ${amountNum} IDRX (${amountInWei} wei)`);
+    console.log(`   IDRX Token: ${chain.idrxTokenAddress}`);
+
+    // Call mint function on IDRX token contract
+    try {
+      const { createWalletClient } = await import("viem");
+      const { http: httpTransport } = await import("viem");
+
+      // Create wallet client for sending transactions
+      const walletClient = createWalletClient({
+        account: signerAccount,
+        chain: {
+          id: chain.chainId,
+          name: chain.name,
+          network: chain.key,
+          nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+          rpcUrls: {
+            default: { http: [chain.rpcUrl!] },
+            public: { http: [chain.rpcUrl!] },
+          },
+        },
+        transport: httpTransport(chain.rpcUrl),
+      });
+
+      // Encode mint function call with recipient address and amount in wei
+      // The mint function signature is: mint(address to, uint256 amount)
+      // This encodes the function call into transaction data
+      const mintData = encodeFunctionData({
+        abi: MOCK_STABLECOIN_ABI,
+        functionName: "mint",
+        args: [walletAddress as Address, BigInt(amountInWei)],
+      });
+
+      console.log("   Sending mint transaction...");
+
+      // Send transaction
+      const txHash = await walletClient.sendTransaction({
+        to: chain.idrxTokenAddress,
+        data: mintData,
+      });
+
+      console.log(`   Transaction sent: ${txHash}`);
+
+      // Wait for transaction confirmation
+      const receipt = await publicClient.waitForTransactionReceipt({
+        hash: txHash,
+      });
+
+      console.log(`   Transaction confirmed in block ${receipt.blockNumber}`);
+
+      // Return success response with transaction hash
+      res.json({
+        success: true,
+        transactionHash: txHash,
+        amount: amountNum.toString(),
+        recipient: walletAddress,
+        chain: chain.key,
+        chainId: chain.chainId,
+      });
+    } catch (mintError) {
+      console.error("   Mint transaction failed:", mintError);
+      return res.status(500).json({
+        error: "mint_failed",
+        message: mintError instanceof Error ? mintError.message : "Failed to mint tokens",
+      });
+    }
+  } catch (error) {
+    console.error("Top-up error:", error);
+    res.status(500).json({
+      error: "topup_failed",
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running: http://localhost:${PORT}`);
   console.log("Endpoints:");
@@ -405,4 +584,5 @@ app.listen(PORT, () => {
   console.log("  POST /sign");
   console.log("  GET  /swap/quote");
   console.log("  POST /swap/build");
+  console.log("  POST /topup-idrx");
 });
