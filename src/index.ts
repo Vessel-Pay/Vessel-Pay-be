@@ -37,6 +37,8 @@ const STABLE_SWAP_ADDRESS = process.env.STABLE_SWAP_ADDRESS as Address | undefin
 const STABLE_SWAP_ADDRESS_ETHERLINK = process.env.STABLE_SWAP_ADDRESS_ETHERLINK as Address | undefined;
 const IDRX_TOKEN_ADDRESS = process.env.IDRX_TOKEN_ADDRESS as Address | undefined;
 const IDRX_TOKEN_ADDRESS_ETHERLINK = process.env.IDRX_TOKEN_ADDRESS_ETHERLINK as Address | undefined;
+const ENTRY_POINT_ADDRESS = process.env.ENTRY_POINT_ADDRESS as Address | undefined;
+const ENTRY_POINT_ADDRESS_ETHERLINK = process.env.ENTRY_POINT_ADDRESS_ETHERLINK as Address | undefined;
 
 if (!PRIVATE_KEY) {
   console.error("ERROR: PAYMASTER_SIGNER_PRIVATE_KEY not found in .env");
@@ -68,6 +70,7 @@ type ChainConfig = {
   rpcUrl?: string;
   stableSwapAddress?: Address;
   idrxTokenAddress?: Address;
+  entryPointAddress?: Address;
 };
 
 const CHAINS: Record<ChainKey, ChainConfig> = {
@@ -78,6 +81,7 @@ const CHAINS: Record<ChainKey, ChainConfig> = {
     rpcUrl: RPC_URL,
     stableSwapAddress: STABLE_SWAP_ADDRESS,
     idrxTokenAddress: IDRX_TOKEN_ADDRESS,
+    entryPointAddress: ENTRY_POINT_ADDRESS,
   },
   etherlink_shadownet: {
     key: "etherlink_shadownet",
@@ -86,6 +90,7 @@ const CHAINS: Record<ChainKey, ChainConfig> = {
     rpcUrl: RPC_URL_ETHERLINK,
     stableSwapAddress: STABLE_SWAP_ADDRESS_ETHERLINK,
     idrxTokenAddress: IDRX_TOKEN_ADDRESS_ETHERLINK,
+    entryPointAddress: ENTRY_POINT_ADDRESS_ETHERLINK,
   },
 };
 
@@ -166,6 +171,23 @@ const MOCK_STABLECOIN_ABI = [
       { name: "amount", type: "uint256" },
     ],
     outputs: [],
+  },
+] as const;
+
+/**
+ * EntryPoint ABI - Used for checking wallet initialization via nonce
+ * The getNonce function returns the nonce for a wallet address
+ */
+const ENTRY_POINT_ABI = [
+  {
+    type: "function",
+    name: "getNonce",
+    stateMutability: "view",
+    inputs: [
+      { name: "sender", type: "address" },
+      { name: "key", type: "uint192" },
+    ],
+    outputs: [{ name: "nonce", type: "uint256" }],
   },
 ] as const;
 
@@ -272,6 +294,55 @@ function getChainContext(req: express.Request): {
   return { chain, publicClient, stableSwapAddress: chain.stableSwapAddress };
 }
 
+/**
+ * Check if a wallet is already initialized on-chain
+ * 
+ * This function checks if a smart wallet has been deployed and initialized by:
+ * 1. Checking if bytecode exists at the wallet address (deployed contract)
+ * 2. Checking if the EntryPoint nonce is greater than 0 (has sent UserOperations)
+ * 
+ * @param walletAddress - The smart wallet address to check
+ * @param publicClient - The viem public client for the chain
+ * @param entryPointAddress - The EntryPoint contract address (optional)
+ * @returns true if wallet is initialized, false otherwise
+ */
+async function checkOnChainActivation(
+  walletAddress: Address,
+  publicClient: ReturnType<typeof createPublicClient>,
+  entryPointAddress?: Address
+): Promise<boolean> {
+  try {
+    // Method 1: Check if bytecode exists at the wallet address
+    const bytecode = await publicClient.getBytecode({ address: walletAddress });
+    if (bytecode && bytecode !== "0x" && bytecode.length > 2) {
+      console.log(`   Wallet ${walletAddress} has bytecode deployed (initialized)`);
+      return true;
+    }
+
+    // Method 2: Check EntryPoint nonce if EntryPoint address is available
+    if (entryPointAddress) {
+      const nonce = await publicClient.readContract({
+        address: entryPointAddress,
+        abi: ENTRY_POINT_ABI,
+        functionName: "getNonce",
+        args: [walletAddress, 0n],
+      }) as bigint;
+
+      if (nonce > 0n) {
+        console.log(`   Wallet ${walletAddress} has nonce ${nonce} (initialized)`);
+        return true;
+      }
+    }
+
+    console.log(`   Wallet ${walletAddress} is not initialized`);
+    return false;
+  } catch (error) {
+    console.error(`   Error checking on-chain activation for ${walletAddress}:`, error);
+    // On error, return false to allow the request to proceed (fail open)
+    return false;
+  }
+}
+
 // =====================================================
 // ROUTES
 // =====================================================
@@ -307,7 +378,8 @@ app.get("/signer", (_, res) => {
  *   tokenAddress: "0x...",
  *   validUntil: 1704067200,
  *   validAfter: 0,
- *   isActivation: false
+ *   isActivation: false,
+ *   chain?: "base" | "etherlink" (optional)
  * }
  */
 app.post("/sign", async (req, res) => {
@@ -323,6 +395,30 @@ app.post("/sign", async (req, res) => {
     console.log("Signing request:");
     console.log(`   payer: ${payerAddress}`);
     console.log(`   token: ${tokenAddress}`);
+    console.log(`   isActivation: ${isActivation}`);
+
+    // Guard: Check on-chain activation status for activation requests
+    if (isActivation === true) {
+      try {
+        const { chain, publicClient } = getChainContext(req);
+        const isInitialized = await checkOnChainActivation(
+          payerAddress as Address,
+          publicClient,
+          chain.entryPointAddress
+        );
+
+        if (isInitialized) {
+          console.log(`   REJECTED: Wallet ${payerAddress} is already activated on-chain`);
+          return res.status(400).json({
+            error: "ALREADY_ACTIVATED",
+            message: "Wallet is already activated on-chain",
+          });
+        }
+      } catch (error) {
+        console.error("   Error during on-chain activation check:", error);
+        // Continue with signing if check fails (fail open to avoid blocking legitimate requests)
+      }
+    }
 
     const signature = await signPaymasterData({
       payerAddress: payerAddress as Address,
