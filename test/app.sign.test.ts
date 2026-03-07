@@ -40,9 +40,11 @@ describe("POST /sign", () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        signPaymasterDataMock.mockResolvedValue("0xnew-signature");
+        putUserOperationMock.mockResolvedValue("stored");
     });
 
-    it("returns persisted signature when operation is replayed", async () => {
+    it("falls back to fresh signature when persisted replay signature is stale", async () => {
         getUserOperationMock.mockResolvedValue({ signature: "0xreplay-signature" });
 
         const response = await request(app)
@@ -59,12 +61,11 @@ describe("POST /sign", () => {
 
         expect(response.status).toBe(200);
         expect(response.body).toEqual({
-            signature: "0xreplay-signature",
+            signature: "0xnew-signature",
             operationHash: "op-hash-1",
-            replayed: true,
         });
-        expect(signPaymasterDataMock).not.toHaveBeenCalled();
-        expect(putUserOperationMock).not.toHaveBeenCalled();
+        expect(signPaymasterDataMock).toHaveBeenCalledTimes(1);
+        expect(putUserOperationMock).toHaveBeenCalledTimes(1);
     });
 
     it("still returns signature when persistence write fails", async () => {

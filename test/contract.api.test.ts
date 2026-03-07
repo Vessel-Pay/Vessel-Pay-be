@@ -10,6 +10,24 @@ const buildTopupOperationHashMock = vi.fn();
 const getTopupIdempotencyRecordMock = vi.fn();
 const putTopupInProgressMock = vi.fn();
 const finalizeTopupIdempotencyMock = vi.fn();
+const readContractMock = vi.fn();
+const getRoutingAdvisoryMock = vi.fn();
+const publishSwapCompletedMock = vi.fn();
+const publishTransactionFailedMock = vi.fn();
+const publishWalletActivatedMock = vi.fn();
+
+vi.mock("viem", async () => {
+    const actual = await vi.importActual<typeof import("viem")>("viem");
+    return {
+        ...actual,
+        createPublicClient: vi.fn().mockImplementation(() => ({
+            readContract: readContractMock,
+            getBytecode: vi.fn().mockResolvedValue("0x"),
+            waitForTransactionReceipt: vi.fn().mockResolvedValue({ blockNumber: 1n }),
+        })),
+        http: vi.fn().mockReturnValue({}),
+    };
+});
 
 vi.mock("../src/services/kmsSigner.js", () => ({
     KmsSignerService: vi.fn().mockImplementation(() => ({
@@ -30,6 +48,16 @@ vi.mock("../src/services/persistence.js", () => ({
         putTopupInProgress: putTopupInProgressMock,
         finalizeTopupIdempotency: finalizeTopupIdempotencyMock,
     })),
+}));
+
+vi.mock("../src/services/aiRouter.js", () => ({
+    getRoutingAdvisory: getRoutingAdvisoryMock,
+}));
+
+vi.mock("../src/services/eventPublisher.js", () => ({
+    publishSwapCompleted: publishSwapCompletedMock,
+    publishTransactionFailed: publishTransactionFailedMock,
+    publishWalletActivated: publishWalletActivatedMock,
 }));
 
 process.env.RPC_URL = "https://example-rpc.local";
@@ -53,12 +81,27 @@ describe("API contract compatibility", () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        readContractMock.mockImplementation(async ({ functionName }: { functionName: string }) => {
+            if (functionName === "reserves") {
+                return 5000n;
+            }
+            return [1200n, 12n, 1212n];
+        });
+        getRoutingAdvisoryMock.mockResolvedValue({
+            enabled: true,
+            selectedChain: "base_sepolia",
+            guardrailsPassed: true,
+        });
+        publishSwapCompletedMock.mockResolvedValue({ published: false, reason: "disabled" });
+        publishTransactionFailedMock.mockResolvedValue({ published: false, reason: "disabled" });
+        publishWalletActivatedMock.mockResolvedValue({ published: false, reason: "disabled" });
         recordSwapBuildMock.mockResolvedValue("swap-id-1");
         buildTopupOperationHashMock.mockReturnValue("topup-op-hash-1");
         getTopupIdempotencyRecordMock.mockResolvedValue(null);
         putTopupInProgressMock.mockResolvedValue("stored");
         finalizeTopupIdempotencyMock.mockResolvedValue(undefined);
-        getUserOperationMock.mockResolvedValue({ signature: "0xreplay-signature" });
+        getUserOperationMock.mockResolvedValue(null);
+        signPaymasterDataMock.mockResolvedValue("0xsignature123");
     });
 
     it("keeps GET /health response shape", async () => {
@@ -81,7 +124,7 @@ describe("API contract compatibility", () => {
         expect(response.body).toHaveProperty("note");
     });
 
-    it("keeps POST /sign replay response shape", async () => {
+    it("keeps POST /sign response shape", async () => {
         const response = await request(app)
             .post("/sign?chain=base")
             .send({

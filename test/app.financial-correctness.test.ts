@@ -81,7 +81,12 @@ describe("Financial correctness: idempotency, duplicates, quote/build consistenc
         putTopupInProgressMock.mockResolvedValue("stored");
         finalizeTopupIdempotencyMock.mockResolvedValue(undefined);
 
-        readContractMock.mockResolvedValue([1200n, 12n, 1212n]);
+        readContractMock.mockImplementation(async ({ functionName }: { functionName: string }) => {
+            if (functionName === "reserves") {
+                return 5000n;
+            }
+            return [1200n, 12n, 1212n];
+        });
         getRoutingAdvisoryMock.mockResolvedValue({
             enabled: true,
             source: "bedrock",
@@ -93,7 +98,7 @@ describe("Financial correctness: idempotency, duplicates, quote/build consistenc
         });
     });
 
-    it("keeps /sign idempotent for duplicate submission payloads", async () => {
+    it("re-signs duplicate /sign payload when persisted signature is stale", async () => {
         getUserOperationMock
             .mockResolvedValueOnce(null)
             .mockResolvedValueOnce({ signature: "0xsignature123" });
@@ -120,8 +125,8 @@ describe("Financial correctness: idempotency, duplicates, quote/build consistenc
         expect(first.status).toBe(200);
         expect(duplicate.status).toBe(200);
         expect(first.body.signature).toBe(duplicate.body.signature);
-        expect(duplicate.body.replayed).toBe(true);
-        expect(signPaymasterDataMock).toHaveBeenCalledTimes(1);
+        expect(duplicate.body.replayed).toBeUndefined();
+        expect(signPaymasterDataMock).toHaveBeenCalledTimes(2);
     });
 
     it("returns 409 for duplicate topup submission race on idempotency insert", async () => {

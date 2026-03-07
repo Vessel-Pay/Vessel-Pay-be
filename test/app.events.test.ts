@@ -13,6 +13,21 @@ const finalizeTopupIdempotencyMock = vi.fn();
 const publishSwapCompletedMock = vi.fn();
 const publishTransactionFailedMock = vi.fn();
 const publishWalletActivatedMock = vi.fn();
+const readContractMock = vi.fn();
+const getRoutingAdvisoryMock = vi.fn();
+
+vi.mock("viem", async () => {
+    const actual = await vi.importActual<typeof import("viem")>("viem");
+    return {
+        ...actual,
+        createPublicClient: vi.fn().mockImplementation(() => ({
+            readContract: readContractMock,
+            getBytecode: vi.fn().mockResolvedValue("0x"),
+            waitForTransactionReceipt: vi.fn().mockResolvedValue({ blockNumber: 1n }),
+        })),
+        http: vi.fn().mockReturnValue({}),
+    };
+});
 
 vi.mock("../src/services/kmsSigner.js", () => ({
     KmsSignerService: vi.fn().mockImplementation(() => ({
@@ -41,6 +56,10 @@ vi.mock("../src/services/eventPublisher.js", () => ({
     publishWalletActivated: publishWalletActivatedMock,
 }));
 
+vi.mock("../src/services/aiRouter.js", () => ({
+    getRoutingAdvisory: getRoutingAdvisoryMock,
+}));
+
 process.env.RPC_URL = "https://example-rpc.local";
 process.env.STABLE_SWAP_ADDRESS = "0x1111111111111111111111111111111111111111";
 process.env.KMS_KEY_ID = "kms-key-id";
@@ -57,6 +76,18 @@ describe("SNS domain event publishing", () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+
+        readContractMock.mockImplementation(async ({ functionName }: { functionName: string }) => {
+            if (functionName === "reserves") {
+                return 5000n;
+            }
+            return [1200n, 12n, 1212n];
+        });
+        getRoutingAdvisoryMock.mockResolvedValue({
+            enabled: true,
+            selectedChain: "base_sepolia",
+            guardrailsPassed: true,
+        });
 
         recordSwapBuildMock.mockResolvedValue("swap-id-1");
         buildTopupOperationHashMock.mockReturnValue("topup-op-hash-1");
