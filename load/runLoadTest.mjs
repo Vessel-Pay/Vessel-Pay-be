@@ -17,6 +17,7 @@ function parseNumber(value, fallback) {
 
 const BASE_URL = process.env.LOAD_BASE_URL;
 const PATH = process.env.LOAD_PATH ?? "/health";
+const METHOD = (process.env.LOAD_METHOD ?? "GET").toUpperCase();
 const DURATION_SECONDS = parseNumber(process.env.LOAD_DURATION_SECONDS, 30);
 const WARMUP_SECONDS = Math.max(0, parseNumber(process.env.LOAD_WARMUP_SECONDS, 0));
 const CONCURRENCY = Math.max(1, Math.floor(parseNumber(process.env.LOAD_CONCURRENCY, 20)));
@@ -25,6 +26,9 @@ const MAX_ERROR_RATE = parseNumber(process.env.LOAD_MAX_ERROR_RATE, 0.01);
 const MAX_P95_MS = parseNumber(process.env.LOAD_MAX_P95_MS, 800);
 const MAX_P99_MS = parseNumber(process.env.LOAD_MAX_P99_MS, 1200);
 const REPORT_FILE = process.env.LOAD_REPORT_FILE?.trim() || "";
+const LOAD_JSON_BODY = process.env.LOAD_JSON_BODY?.trim() || "";
+const LOAD_API_KEY = process.env.LOAD_API_KEY?.trim() || "";
+const IDEMPOTENCY_KEY_PREFIX = process.env.LOAD_IDEMPOTENCY_KEY_PREFIX?.trim() || "";
 
 if (!BASE_URL) {
   console.error("LOAD_BASE_URL is required (example: https://api.example.com/prod)");
@@ -35,12 +39,23 @@ const normalizedBaseUrl = BASE_URL.endsWith("/") ? BASE_URL.slice(0, -1) : BASE_
 const normalizedPath = PATH.startsWith("/") ? PATH : `/${PATH}`;
 const targetUrl = `${normalizedBaseUrl}${normalizedPath}`;
 
+let parsedJsonBody;
+if (LOAD_JSON_BODY) {
+  try {
+    parsedJsonBody = JSON.parse(LOAD_JSON_BODY);
+  } catch {
+    console.error("LOAD_JSON_BODY must be valid JSON");
+    process.exit(1);
+  }
+}
+
 const latencies = [];
 let total = 0;
 let success = 0;
 let failed = 0;
 let timeoutFailures = 0;
 const statusCounts = new Map();
+let requestSequence = 0;
 const startedAt = performance.now();
 const measurementStartAt = startedAt + WARMUP_SECONDS * 1000;
 const endAt = startedAt + DURATION_SECONDS * 1000;
@@ -49,14 +64,31 @@ async function singleRequest() {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const start = performance.now();
+  requestSequence += 1;
+  const requestId = requestSequence;
+
+  const headers = {
+    Accept: "application/json",
+  };
+
+  if (LOAD_API_KEY) {
+    headers["x-api-key"] = LOAD_API_KEY;
+  }
+
+  if (parsedJsonBody !== undefined) {
+    headers["content-type"] = "application/json";
+  }
+
+  if (IDEMPOTENCY_KEY_PREFIX) {
+    headers["idempotency-key"] = `${IDEMPOTENCY_KEY_PREFIX}-${requestId}`;
+  }
 
   try {
     const response = await fetch(targetUrl, {
-      method: "GET",
+      method: METHOD,
       signal: controller.signal,
-      headers: {
-        Accept: "application/json",
-      },
+      headers,
+      ...(parsedJsonBody !== undefined ? { body: JSON.stringify(parsedJsonBody) } : {}),
     });
 
     const elapsed = performance.now() - start;
@@ -112,6 +144,7 @@ const rps = totalDurationMs > 0 ? (total / totalDurationMs) * 1000 : 0;
 
 const report = {
   targetUrl,
+  method: METHOD,
   warmupSeconds: WARMUP_SECONDS,
   durationSeconds: DURATION_SECONDS,
   concurrency: CONCURRENCY,

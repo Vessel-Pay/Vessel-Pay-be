@@ -135,6 +135,25 @@ describe("Request context and logging headers", () => {
         expect(response.headers["x-request-id"]).toBe(requestId);
     });
 
+    it("replaces unsafe inbound x-request-id with generated value", async () => {
+        const unsafeRequestId = "bad/request-id";
+
+        const response = await request(app)
+            .post("/swap/build?chain=base")
+            .set("x-request-id", unsafeRequestId)
+            .send({
+                tokenIn: "0x3333333333333333333333333333333333333333",
+                tokenOut: "0x4444444444444444444444444444444444444444",
+                amountIn: "1000",
+                minAmountOut: "900",
+            });
+
+        expect(response.status).toBe(200);
+        expect(typeof response.headers["x-request-id"]).toBe("string");
+        expect(response.headers["x-request-id"]).not.toBe(unsafeRequestId);
+        expect(response.headers["x-request-id"]).not.toContain("/");
+    });
+
     it("returns generated x-request-id on /swap/quote validation failure", async () => {
         const response = await request(app)
             .get("/swap/quote?chain=base")
@@ -201,6 +220,53 @@ describe("Request context and logging headers", () => {
         expect(response.status).toBe(400);
         expect(response.body.error).toBe("invalid_idempotency_key");
         expect(putTopupInProgressMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects malformed Idempotency-Key header format", async () => {
+        const response = await request(app)
+            .post("/topup-idrx")
+            .set("x-api-key", "test-topup-key")
+            .set("x-forwarded-for", "10.1.9.77")
+            .set("idempotency-key", "bad key with spaces")
+            .send({
+                walletAddress: "0x3333333333333333333333333333333333333333",
+                amount: "100",
+                chain: "base",
+            });
+
+        expect(response.status).toBe(400);
+        expect(response.body.error).toBe("invalid_idempotency_key");
+        expect(response.body.message).toContain("format");
+        expect(putTopupInProgressMock).not.toHaveBeenCalled();
+    });
+
+    it("emits baseline security headers on /health", async () => {
+        const response = await request(app).get("/health");
+
+        expect(response.status).toBe(200);
+        expect(response.headers["x-content-type-options"]).toBe("nosniff");
+        expect(response.headers["x-frame-options"]).toBe("DENY");
+        expect(response.headers["referrer-policy"]).toBe("no-referrer");
+        expect(response.headers["cache-control"]).toBe("no-store");
+    });
+
+    it("rejects malformed JSON payloads", async () => {
+        const response = await request(app)
+            .post("/ai/copilot")
+            .set("content-type", "application/json")
+            .send('{"prompt": ');
+
+        expect(response.status).toBe(400);
+        expect(response.body.error).toBe("invalid_json");
+    });
+
+    it("rejects oversized JSON payloads", async () => {
+        const response = await request(app)
+            .post("/ai/copilot")
+            .send({ prompt: "x".repeat(25_000) });
+
+        expect(response.status).toBe(413);
+        expect(response.body.error).toBe("payload_too_large");
     });
 
     it("replays completed topup result for duplicate idempotency key", async () => {

@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { timingSafeEqual } from "node:crypto";
 import {
   createPublicClient,
   encodePacked,
@@ -20,7 +21,11 @@ import { KmsSignerService } from "./services/kmsSigner.js";
 import { PersistenceService } from "./services/persistence.js";
 import { createRequestContext, getLatencyMs } from "./services/requestContext.js";
 import { logger } from "./services/logger.js";
-import { assertSignValidityWindow, isValidationError } from "./services/validation.js";
+import {
+  assertSignValidityWindow,
+  isValidationError,
+  parseDecimalAmountToBaseUnits,
+} from "./services/validation.js";
 import { emitCountMetric } from "./services/metrics.js";
 import {
   publishSwapCompleted,
@@ -33,7 +38,6 @@ import { buildCopilotActionPlan } from "./services/paymentCopilot.js";
 import { assignAiExperimentVariant, computeSwapIntelligenceSummary } from "./services/aiSwapIntelligence.js";
 import { isAgentCoreConfigured, runAgentCore } from "./services/agentCore.js";
 import { generateKiroPlan } from "./services/kiroPlanner.js";
-import { isSagemakerInferenceConfigured, runSagemakerInference } from "./services/sagemakerInference.js";
 
 dotenv.config();
 
@@ -49,6 +53,13 @@ const SIGN_RATE_LIMIT_PER_MINUTE = Number.parseInt(
 const TOPUP_RATE_LIMIT_PER_MINUTE = Number.parseInt(
   process.env.TOPUP_RATE_LIMIT_PER_MINUTE ?? "30",
   10
+);
+const AI_RATE_LIMIT_PER_MINUTE = Number.parseInt(
+  process.env.AI_RATE_LIMIT_PER_MINUTE ?? "20",
+  10
+);
+const FAIL_CLOSED_API_KEYS = ["1", "true", "yes", "on"].includes(
+  (process.env.FAIL_CLOSED_API_KEYS ?? "false").trim().toLowerCase()
 );
 
 const corsOriginValues = (process.env.CORS_ORIGINS ?? "*")
@@ -126,17 +137,45 @@ const topupRateLimiter = createRateLimiter({
   scope: "topup",
   maxPerMinute: TOPUP_RATE_LIMIT_PER_MINUTE,
 });
+const aiRateLimiter = createRateLimiter({
+  scope: "ai",
+  maxPerMinute: AI_RATE_LIMIT_PER_MINUTE,
+});
 
-function requireScopedApiKey(requiredKey?: string): express.RequestHandler {
+function safeKeyMatch(presentedKey: string, requiredKey: string): boolean {
+  const left = Buffer.from(presentedKey, "utf8");
+  const right = Buffer.from(requiredKey, "utf8");
+
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return timingSafeEqual(left, right);
+}
+
+function requireScopedApiKey(requiredKey?: string, options?: { failClosedWhenUnconfigured?: boolean }): express.RequestHandler {
+  const failClosed = options?.failClosedWhenUnconfigured ?? false;
+
   return (req, res, next) => {
     if (!requiredKey) {
+      if (failClosed) {
+        emitCountMetric("UserOperationSubmissionFailure", 1, {
+          endpoint: req.path,
+        });
+
+        return res.status(503).json({
+          error: "service_unavailable",
+          message: "Endpoint authentication is not configured",
+        });
+      }
+
       return next();
     }
 
     const keyHeader = req.headers["x-api-key"];
     const presentedKey = typeof keyHeader === "string" ? keyHeader.trim() : "";
 
-    if (presentedKey === requiredKey) {
+    if (safeKeyMatch(presentedKey, requiredKey)) {
       return next();
     }
 
@@ -151,13 +190,43 @@ function requireScopedApiKey(requiredKey?: string): express.RequestHandler {
   };
 }
 
-const requireSignApiKey = requireScopedApiKey(EDGE_SIGN_API_KEY);
-const requireTopupApiKey = requireScopedApiKey(EDGE_TOPUP_API_KEY);
+const requireSignApiKey = requireScopedApiKey(EDGE_SIGN_API_KEY, {
+  failClosedWhenUnconfigured: FAIL_CLOSED_API_KEYS,
+});
+const requireTopupApiKey = requireScopedApiKey(EDGE_TOPUP_API_KEY, {
+  failClosedWhenUnconfigured: FAIL_CLOSED_API_KEYS,
+});
 
 const RISK_BLOCK_LEVEL = (process.env.RISK_BLOCK_LEVEL ?? "high").toLowerCase();
+const MAX_JSON_BODY_BYTES = Number.parseInt(process.env.MAX_JSON_BODY_BYTES ?? "16384", 10);
 
 // Middleware
-app.use(express.json());
+app.use(
+  express.json({
+    limit: Number.isFinite(MAX_JSON_BODY_BYTES) && MAX_JSON_BODY_BYTES > 0
+      ? `${MAX_JSON_BODY_BYTES}b`
+      : "16384b",
+  })
+);
+
+app.use((req, res, next) => {
+  const isTlsRequest =
+    req.secure ||
+    req.headers["x-forwarded-proto"] === "https" ||
+    req.headers[":scheme"] === "https";
+
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("x-frame-options", "DENY");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("permissions-policy", "geolocation=(), microphone=(), camera=()");
+  res.setHeader("cache-control", "no-store");
+
+  if (isTlsRequest) {
+    res.setHeader("strict-transport-security", "max-age=31536000; includeSubDomains");
+  }
+
+  next();
+});
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -218,7 +287,27 @@ if (process.env.PAYMASTER_SIGNER_PRIVATE_KEY) {
 }
 
 if (!EDGE_SIGN_API_KEY && !EDGE_TOPUP_API_KEY) {
-  console.warn("WARN: EDGE_SIGN_API_KEY / EDGE_TOPUP_API_KEY not configured; sensitive routes rely on IAM/app-level controls only.");
+  console.warn(
+    FAIL_CLOSED_API_KEYS
+      ? "WARN: EDGE_SIGN_API_KEY / EDGE_TOPUP_API_KEY not configured; sensitive routes will fail closed."
+      : "WARN: EDGE_SIGN_API_KEY / EDGE_TOPUP_API_KEY not configured; sensitive routes rely on IAM/app-level controls only."
+  );
+}
+
+function sanitizeAgentFallbackReason(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "AgentCore invoke failed";
+  }
+
+  const message = error.message.toLowerCase();
+  if (message.includes("access denied")) {
+    return "AgentCore provider access denied";
+  }
+  if (message.includes("throttl") || message.includes("too many")) {
+    return "AgentCore provider throttled request";
+  }
+
+  return "AgentCore provider invocation failed";
 }
 
 const secretsManagerClient = FAUCET_SIGNER_SECRET_ARN
@@ -509,6 +598,11 @@ function normalizeTimestamp(value: unknown, fallback: number, field: string): nu
   return Math.floor(parsed);
 }
 
+function isValidIdempotencyKey(key: string): boolean {
+  // Keep key format strict and storage-safe while allowing common client-generated IDs.
+  return /^[A-Za-z0-9:_\-]{8,128}$/.test(key);
+}
+
 function resolveChainKey(input: unknown): ChainKey {
   const parsed = parseChainKey(input);
   return parsed ?? DEFAULT_CHAIN;
@@ -763,7 +857,7 @@ app.get("/signer", (_, res) => {
   });
 });
 
-app.post("/risk/assess", async (req, res) => {
+app.post("/risk/assess", aiRateLimiter, async (req, res) => {
   try {
     const payerAddress = requireAddress(req.body?.payerAddress, "payerAddress");
     const tokenAddress = requireAddress(req.body?.tokenAddress, "tokenAddress");
@@ -802,7 +896,7 @@ app.post("/risk/assess", async (req, res) => {
   }
 });
 
-app.post("/ai/copilot", async (req, res) => {
+app.post("/ai/copilot", aiRateLimiter, async (req, res) => {
   try {
     const promptRaw = req.body?.prompt;
     const prompt = typeof promptRaw === "string" ? promptRaw.trim() : "";
@@ -826,7 +920,7 @@ app.post("/ai/copilot", async (req, res) => {
   }
 });
 
-app.post("/ai/agentcore/session", async (req, res) => {
+app.post("/ai/agentcore/session", aiRateLimiter, async (req, res) => {
   try {
     const inputTextRaw = req.body?.inputText;
     const inputText = typeof inputTextRaw === "string" ? inputTextRaw.trim() : "";
@@ -840,30 +934,41 @@ app.post("/ai/agentcore/session", async (req, res) => {
     const sessionIdRaw = req.body?.sessionId;
     const userIdRaw = req.body?.userId;
 
-    if (!isAgentCoreConfigured()) {
+    const buildFallbackResponse = async (fallbackReason: string) => {
       const fallbackPlan = await buildCopilotActionPlan(inputText);
       const fallbackSessionId =
         typeof sessionIdRaw === "string" && sessionIdRaw.trim() !== ""
           ? sessionIdRaw.trim()
           : `agentcore-fallback-${Date.now()}`;
 
-      return res.json({
+      return {
         ok: true,
         provider: "bedrock-agentcore-fallback",
         configured: false,
+        fallbackReason,
         result: {
           sessionId: fallbackSessionId,
           outputText: fallbackPlan.summary,
         },
         fallbackPlan,
-      });
+      };
+    };
+
+    if (!isAgentCoreConfigured()) {
+      return res.json(await buildFallbackResponse("AGENTCORE_AGENT_ID / AGENTCORE_AGENT_ALIAS_ID not configured"));
     }
 
-    const result = await runAgentCore({
-      inputText,
-      sessionId: typeof sessionIdRaw === "string" ? sessionIdRaw : undefined,
-      userId: typeof userIdRaw === "string" ? userIdRaw : undefined,
-    });
+    let result;
+    try {
+      result = await runAgentCore({
+        inputText,
+        sessionId: typeof sessionIdRaw === "string" ? sessionIdRaw : undefined,
+        userId: typeof userIdRaw === "string" ? userIdRaw : undefined,
+      });
+    } catch (agentError) {
+      const fallbackReason = sanitizeAgentFallbackReason(agentError);
+      return res.json(await buildFallbackResponse(fallbackReason));
+    }
 
     return res.json({
       ok: true,
@@ -878,7 +983,7 @@ app.post("/ai/agentcore/session", async (req, res) => {
   }
 });
 
-app.post("/ai/kiro/plan", async (req, res) => {
+app.post("/ai/kiro/plan", aiRateLimiter, async (req, res) => {
   try {
     const goalRaw = req.body?.goal;
     const goal = typeof goalRaw === "string" ? goalRaw.trim() : "";
@@ -912,52 +1017,7 @@ app.post("/ai/kiro/plan", async (req, res) => {
   }
 });
 
-app.post("/ai/sagemaker/infer", async (req, res) => {
-  try {
-    const endpointNameRaw = req.body?.endpointName;
-    const endpointName =
-      typeof endpointNameRaw === "string" ? endpointNameRaw : undefined;
-
-    if (!isSagemakerInferenceConfigured(endpointName)) {
-      return res.json({
-        ok: true,
-        provider: "sagemaker-runtime-fallback",
-        configured: false,
-        inference: {
-          endpointName: endpointName ?? process.env.SAGEMAKER_ENDPOINT_NAME ?? "",
-          contentType:
-            typeof req.body?.contentType === "string" ? req.body.contentType : "application/json",
-          response: {
-            fallback: true,
-            recommendedChain: "base_sepolia",
-            confidence: 0.5,
-            reason: "SAGEMAKER_ENDPOINT_NAME is not configured; deterministic fallback response returned.",
-          },
-        },
-      });
-    }
-
-    const inference = await runSagemakerInference({
-      payload: req.body?.payload,
-      endpointName,
-      contentType:
-        typeof req.body?.contentType === "string" ? req.body.contentType : undefined,
-    });
-
-    return res.json({
-      ok: true,
-      provider: "sagemaker-runtime",
-      inference,
-    });
-  } catch (error) {
-    return res.status(400).json({
-      error: "sagemaker_inference_failed",
-      message: error instanceof Error ? error.message : "Unknown error",
-    });
-  }
-});
-
-app.get("/ai/merchant/dashboard", async (req, res) => {
+app.get("/ai/merchant/dashboard", aiRateLimiter, async (req, res) => {
   try {
     const requestedWindowDays = Number.parseInt(String(req.query?.windowDays ?? "30"), 10);
     const windowDays = Number.isFinite(requestedWindowDays)
@@ -1769,9 +1829,12 @@ app.post("/topup-idrx", requireTopupApiKey, topupRateLimiter, async (req, res) =
       });
     }
 
-    // Validate amount is a positive number
-    const amountNum = Number(amount);
-    if (isNaN(amountNum) || amountNum <= 0) {
+    // Validate and parse amount to base units with exact decimal precision.
+    let amountInWei: bigint;
+    const amountDisplay = typeof amount === "string" ? amount.trim() : String(amount);
+    try {
+      amountInWei = parseDecimalAmountToBaseUnits(amount, 6);
+    } catch (error) {
       emitCountMetric("TopupFailure", 1, { endpoint: "/topup-idrx" });
 
       logger.warn({
@@ -1781,22 +1844,17 @@ app.post("/topup-idrx", requireTopupApiKey, topupRateLimiter, async (req, res) =
         latencyMs: getLatencyMs(requestContext),
         result: "failure",
         errorClass: "invalid_amount",
-        message: "amount must be a positive number",
+        message: error instanceof Error ? error.message : "amount is invalid",
       });
 
       return res.status(400).json({
         error: "invalid_amount",
-        message: "amount must be a positive number",
+        message: error instanceof Error ? error.message : "amount is invalid",
       });
     }
 
-    // Parse amount to wei units (6 decimals for IDRX)
-    // IDRX uses 6 decimal places, so multiply by 10^6 to convert to smallest unit
-    // Example: 100.50 IDRX → 100,500,000 wei
-    const amountInWei = Math.floor(amountNum * 1_000_000);
-
     // Validate amount does not exceed maximum safe integer
-    if (amountInWei > Number.MAX_SAFE_INTEGER) {
+    if (amountInWei > BigInt(Number.MAX_SAFE_INTEGER)) {
       emitCountMetric("TopupFailure", 1, { endpoint: "/topup-idrx" });
 
       logger.warn({
@@ -1859,6 +1917,26 @@ app.post("/topup-idrx", requireTopupApiKey, topupRateLimiter, async (req, res) =
       return res.status(400).json({
         error: "invalid_idempotency_key",
         message: "Idempotency-Key header is required",
+      });
+    }
+
+    if (!isValidIdempotencyKey(idempotencyKey)) {
+      emitCountMetric("TopupFailure", 1, { endpoint: "/topup-idrx" });
+
+      logger.warn({
+        requestId: requestContext.requestId,
+        endpoint: "/topup-idrx",
+        method: "POST",
+        chainId: chain.chainId,
+        latencyMs: getLatencyMs(requestContext),
+        result: "failure",
+        errorClass: "invalid_idempotency_key",
+        message: "Idempotency-Key format is invalid",
+      });
+
+      return res.status(400).json({
+        error: "invalid_idempotency_key",
+        message: "Idempotency-Key format is invalid",
       });
     }
 
@@ -2004,7 +2082,7 @@ app.post("/topup-idrx", requireTopupApiKey, topupRateLimiter, async (req, res) =
     console.log("Top-up IDRX request:");
     console.log(`   Chain: ${chain.name} (${chain.chainId})`);
     console.log(`   Wallet: ${normalizedWalletAddress}`);
-    console.log(`   Amount: ${amountNum} IDRX (${amountInWei} wei)`);
+    console.log(`   Amount: ${amountDisplay} IDRX (${amountInWei} wei)`);
     console.log(`   IDRX Token: ${chain.idrxTokenAddress}`);
 
     // Call mint function on IDRX token contract
@@ -2034,7 +2112,7 @@ app.post("/topup-idrx", requireTopupApiKey, topupRateLimiter, async (req, res) =
       const mintData = encodeFunctionData({
         abi: MOCK_STABLECOIN_ABI,
         functionName: "mint",
-        args: [normalizedWalletAddress, BigInt(amountInWei)],
+        args: [normalizedWalletAddress, amountInWei],
       });
 
       console.log("   Sending mint transaction...");
@@ -2059,7 +2137,7 @@ app.post("/topup-idrx", requireTopupApiKey, topupRateLimiter, async (req, res) =
         await persistence.recordWalletActivation(normalizedWalletAddress, {
           chain: chain.key,
           transactionHash: txHash,
-          amount: amountNum.toString(),
+          amount: amountDisplay,
         });
       } catch (persistError) {
         console.error("Failed to persist wallet activation:", persistError);
@@ -2068,7 +2146,7 @@ app.post("/topup-idrx", requireTopupApiKey, topupRateLimiter, async (req, res) =
       const successPayload = {
         success: true,
         transactionHash: txHash,
-        amount: amountNum.toString(),
+        amount: amountDisplay,
         recipient: normalizedWalletAddress,
         chain: chain.key,
         chainId: chain.chainId,
@@ -2086,7 +2164,7 @@ app.post("/topup-idrx", requireTopupApiKey, topupRateLimiter, async (req, res) =
         chain: chain.key,
         chainId: chain.chainId,
         walletAddress: normalizedWalletAddress,
-        amount: amountNum.toString(),
+        amount: amountDisplay,
         transactionHash: txHash,
       });
 
@@ -2179,6 +2257,30 @@ app.use((error: unknown, _req: express.Request, res: express.Response, next: exp
     return res.status(403).json({
       error: "cors_origin_not_allowed",
       message: "Request origin is not allowed",
+    });
+  }
+
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "type" in error &&
+    (error as { type?: string }).type === "entity.too.large"
+  ) {
+    return res.status(413).json({
+      error: "payload_too_large",
+      message: "Request payload exceeds maximum allowed size",
+    });
+  }
+
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "type" in error &&
+    (error as { type?: string }).type === "entity.parse.failed"
+  ) {
+    return res.status(400).json({
+      error: "invalid_json",
+      message: "Malformed JSON request body",
     });
   }
 

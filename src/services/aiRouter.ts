@@ -22,12 +22,12 @@ type ProviderAdvisory = {
     confidence?: number;
     reason?: string;
     estimatedFeeBps?: number;
-    provider: "bedrock" | "sagemaker";
+    provider: "bedrock";
 };
 
 export type RoutingAdvisory = {
     enabled: boolean;
-    source: "deterministic" | "bedrock" | "sagemaker";
+    source: "deterministic" | "bedrock";
     selectedChain: ChainKey;
     confidence: number;
     reason: string;
@@ -52,16 +52,11 @@ const AI_CHAIN_ALLOWLIST = new Set(
 );
 const AI_FEE_CAP_BPS = Number.parseInt(process.env.AI_FEE_CAP_BPS ?? "100", 10);
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID?.trim() ?? "";
-const SAGEMAKER_ENDPOINT_NAME = process.env.SAGEMAKER_ENDPOINT_NAME?.trim() ?? "";
 const AI_ROUTER_PROVIDER = (process.env.AI_ROUTER_PROVIDER ?? "auto").toLowerCase();
 
 let bedrockClient: unknown;
 let bedrockInvokeCtor: new (...args: any[]) => any;
 let bedrockLoadPromise: Promise<void> | undefined;
-
-let sagemakerClient: unknown;
-let sagemakerInvokeCtor: new (...args: any[]) => any;
-let sagemakerLoadPromise: Promise<void> | undefined;
 
 const warnedKeys = new Set<string>();
 
@@ -74,16 +69,8 @@ function warnOnce(key: string, message: string): void {
 }
 
 function hasConfiguredProvider(): boolean {
-    if (AI_ROUTER_PROVIDER === "bedrock") {
+    if (AI_ROUTER_PROVIDER === "bedrock" || AI_ROUTER_PROVIDER === "auto") {
         return BEDROCK_MODEL_ID.length > 0;
-    }
-
-    if (AI_ROUTER_PROVIDER === "sagemaker") {
-        return SAGEMAKER_ENDPOINT_NAME.length > 0;
-    }
-
-    if (AI_ROUTER_PROVIDER === "auto") {
-        return BEDROCK_MODEL_ID.length > 0 || SAGEMAKER_ENDPOINT_NAME.length > 0;
     }
 
     return false;
@@ -171,7 +158,7 @@ function sanitizeProviderChain(chain: unknown): ChainKey | undefined {
     return chain;
 }
 
-function parseProviderPayload(raw: unknown, provider: "bedrock" | "sagemaker"): ProviderAdvisory | undefined {
+function parseProviderPayload(raw: unknown, provider: "bedrock"): ProviderAdvisory | undefined {
     if (!raw || typeof raw !== "object") {
         return undefined;
     }
@@ -282,60 +269,6 @@ async function invokeBedrock(input: AdvisoryInput): Promise<ProviderAdvisory | u
     }
 }
 
-async function ensureSagemakerLoaded(): Promise<void> {
-    if (sagemakerClient && sagemakerInvokeCtor) {
-        return;
-    }
-
-    if (sagemakerLoadPromise) {
-        return sagemakerLoadPromise;
-    }
-
-    sagemakerLoadPromise = (async () => {
-        const module = await import("@aws-sdk/client-sagemaker-runtime");
-        const SageMakerRuntimeClientCtor = module.SageMakerRuntimeClient;
-        sagemakerInvokeCtor = module.InvokeEndpointCommand;
-        sagemakerClient = new SageMakerRuntimeClientCtor({ region: process.env.AWS_REGION });
-    })();
-
-    return sagemakerLoadPromise;
-}
-
-async function invokeSagemaker(input: AdvisoryInput): Promise<ProviderAdvisory | undefined> {
-    if (!SAGEMAKER_ENDPOINT_NAME) {
-        return undefined;
-    }
-
-    try {
-        await ensureSagemakerLoaded();
-
-        const command = new sagemakerInvokeCtor({
-            EndpointName: SAGEMAKER_ENDPOINT_NAME,
-            ContentType: "application/json",
-            Body: JSON.stringify(input),
-        });
-
-        const response = await (sagemakerClient as {
-            send: (cmd: unknown) => Promise<{ Body?: Uint8Array }>;
-        }).send(command);
-
-        if (!response.Body) {
-            return undefined;
-        }
-
-        const decoded = new TextDecoder().decode(response.Body);
-        const parsed = JSON.parse(decoded) as unknown;
-        return parseProviderPayload(parsed, "sagemaker");
-    } catch (error) {
-        warnOnce(
-            "sagemaker_invoke_failed",
-            `AI router SageMaker invoke failed; deterministic fallback will be used. ${error instanceof Error ? error.message : "unknown error"
-            }`
-        );
-        return undefined;
-    }
-}
-
 function runGuardrails(input: AdvisoryInput, providerResult: ProviderAdvisory): {
     accepted: boolean;
     selectedChain: ChainKey;
@@ -398,7 +331,7 @@ export async function getRoutingAdvisory(input: AdvisoryInput): Promise<RoutingA
     if (!hasConfiguredProvider()) {
         warnOnce(
             "ai_provider_not_configured",
-            "AI router is enabled but no provider is configured. Set BEDROCK_MODEL_ID or SAGEMAKER_ENDPOINT_NAME."
+            "AI router is enabled but no provider is configured. Set BEDROCK_MODEL_ID."
         );
         return deterministicAdvisory(
             input,
@@ -414,10 +347,6 @@ export async function getRoutingAdvisory(input: AdvisoryInput): Promise<RoutingA
 
     if (AI_ROUTER_PROVIDER === "bedrock" || AI_ROUTER_PROVIDER === "auto") {
         providerResult = await invokeBedrock(input);
-    }
-
-    if (!providerResult && (AI_ROUTER_PROVIDER === "sagemaker" || AI_ROUTER_PROVIDER === "auto")) {
-        providerResult = await invokeSagemaker(input);
     }
 
     if (!providerResult) {

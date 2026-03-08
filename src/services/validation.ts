@@ -41,3 +41,35 @@ export function assertSignValidityWindow(
 export function isValidationError(error: unknown): error is ValidationError {
     return error instanceof ValidationError;
 }
+
+export function parseDecimalAmountToBaseUnits(input: unknown, decimals: number): bigint {
+    if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) {
+        throw new ValidationError("invalid_amount_config", "decimals must be an integer between 0 and 18");
+    }
+
+    const raw = typeof input === "number" ? String(input) : typeof input === "string" ? input : "";
+    const amount = raw.trim();
+
+    // Disallow scientific notation and non-decimal formats to prevent ambiguous client input.
+    if (!/^\d+(\.\d+)?$/.test(amount)) {
+        throw new ValidationError("invalid_amount_format", "amount must be a decimal string");
+    }
+
+    const [wholePart, fractionalPartRaw = ""] = amount.split(".");
+    if (fractionalPartRaw.length > decimals) {
+        throw new ValidationError(
+            "invalid_amount_precision",
+            `amount supports up to ${decimals} decimal places`
+        );
+    }
+
+    const paddedFraction = fractionalPartRaw.padEnd(decimals, "0");
+    const normalized = `${wholePart}${paddedFraction}`.replace(/^0+(?=\d)/, "");
+    const units = BigInt(normalized === "" ? "0" : normalized);
+
+    if (units <= 0n) {
+        throw new ValidationError("invalid_amount", "amount must be a positive number");
+    }
+
+    return units;
+}

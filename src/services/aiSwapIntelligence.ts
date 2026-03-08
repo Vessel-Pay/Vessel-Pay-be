@@ -13,7 +13,7 @@ type QuoteByChain = Partial<Record<ChainKey, QuoteSnapshot>>;
 type AdvisoryLike = {
     selectedChain: ChainKey;
     guardrailsPassed: boolean;
-    source: "deterministic" | "bedrock" | "sagemaker";
+    source: "deterministic" | "bedrock";
     reason: string;
 };
 
