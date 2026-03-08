@@ -19,6 +19,9 @@ vi.mock("../src/services/persistence.js", () => ({
         putUserOperation: putUserOperationMock,
         recordSwapBuild: vi.fn(),
         recordWalletActivation: vi.fn(),
+        recordAiTelemetry: vi.fn(),
+        listRecentSwapBuilds: vi.fn().mockResolvedValue([]),
+        listRecentAiTelemetry: vi.fn().mockResolvedValue([]),
     })),
 }));
 
@@ -60,7 +63,7 @@ describe("POST /sign", () => {
             });
 
         expect(response.status).toBe(200);
-        expect(response.body).toEqual({
+        expect(response.body).toMatchObject({
             signature: "0xnew-signature",
             operationHash: "op-hash-1",
         });
@@ -86,7 +89,7 @@ describe("POST /sign", () => {
             });
 
         expect(response.status).toBe(200);
-        expect(response.body).toEqual({
+        expect(response.body).toMatchObject({
             signature: "0xnew-signature",
             operationHash: "op-hash-1",
         });

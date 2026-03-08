@@ -47,6 +47,9 @@ vi.mock("../src/services/persistence.js", () => ({
         getTopupIdempotencyRecord: getTopupIdempotencyRecordMock,
         putTopupInProgress: putTopupInProgressMock,
         finalizeTopupIdempotency: finalizeTopupIdempotencyMock,
+        recordAiTelemetry: vi.fn(),
+        listRecentSwapBuilds: vi.fn().mockResolvedValue([]),
+        listRecentAiTelemetry: vi.fn().mockResolvedValue([]),
     })),
 }));
 

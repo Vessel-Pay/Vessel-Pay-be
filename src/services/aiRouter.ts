@@ -36,6 +36,11 @@ export type RoutingAdvisory = {
     estimatedFeeBps?: number;
 };
 
+type DeterministicAdvisoryOptions = {
+    enabled?: boolean;
+    rejectedReason?: string;
+};
+
 const ENABLE_AI_ROUTER = (process.env.ENABLE_AI_ROUTER ?? "false").toLowerCase() === "true";
 const AI_ROUTER_STAGING_ONLY = (process.env.AI_ROUTER_STAGING_ONLY ?? "true").toLowerCase() === "true";
 const APP_ENVIRONMENT = (process.env.ENVIRONMENT ?? "").toLowerCase();
@@ -57,6 +62,32 @@ let bedrockLoadPromise: Promise<void> | undefined;
 let sagemakerClient: unknown;
 let sagemakerInvokeCtor: new (...args: any[]) => any;
 let sagemakerLoadPromise: Promise<void> | undefined;
+
+const warnedKeys = new Set<string>();
+
+function warnOnce(key: string, message: string): void {
+    if (warnedKeys.has(key)) {
+        return;
+    }
+    warnedKeys.add(key);
+    console.warn(message);
+}
+
+function hasConfiguredProvider(): boolean {
+    if (AI_ROUTER_PROVIDER === "bedrock") {
+        return BEDROCK_MODEL_ID.length > 0;
+    }
+
+    if (AI_ROUTER_PROVIDER === "sagemaker") {
+        return SAGEMAKER_ENDPOINT_NAME.length > 0;
+    }
+
+    if (AI_ROUTER_PROVIDER === "auto") {
+        return BEDROCK_MODEL_ID.length > 0 || SAGEMAKER_ENDPOINT_NAME.length > 0;
+    }
+
+    return false;
+}
 
 function isAiRouterActive(): boolean {
     if (!ENABLE_AI_ROUTER) {
@@ -116,15 +147,20 @@ function resolveBestDeterministicChain(input: AdvisoryInput): ChainKey {
     return bestChain;
 }
 
-function deterministicAdvisory(input: AdvisoryInput, reason: string): RoutingAdvisory {
+function deterministicAdvisory(
+    input: AdvisoryInput,
+    reason: string,
+    options?: DeterministicAdvisoryOptions
+): RoutingAdvisory {
     const selectedChain = resolveBestDeterministicChain(input);
     return {
-        enabled: false,
+        enabled: options?.enabled ?? false,
         source: "deterministic",
         selectedChain,
         confidence: 1,
         reason,
         guardrailsPassed: true,
+        rejectedReason: options?.rejectedReason,
     };
 }
 
@@ -236,7 +272,12 @@ async function invokeBedrock(input: AdvisoryInput): Promise<ProviderAdvisory | u
         }
 
         return parseProviderPayload(parsed, "bedrock");
-    } catch {
+    } catch (error) {
+        warnOnce(
+            "bedrock_invoke_failed",
+            `AI router Bedrock invoke failed; deterministic fallback will be used. ${error instanceof Error ? error.message : "unknown error"
+            }`
+        );
         return undefined;
     }
 }
@@ -285,7 +326,12 @@ async function invokeSagemaker(input: AdvisoryInput): Promise<ProviderAdvisory |
         const decoded = new TextDecoder().decode(response.Body);
         const parsed = JSON.parse(decoded) as unknown;
         return parseProviderPayload(parsed, "sagemaker");
-    } catch {
+    } catch (error) {
+        warnOnce(
+            "sagemaker_invoke_failed",
+            `AI router SageMaker invoke failed; deterministic fallback will be used. ${error instanceof Error ? error.message : "unknown error"
+            }`
+        );
         return undefined;
     }
 }
@@ -349,6 +395,21 @@ export async function getRoutingAdvisory(input: AdvisoryInput): Promise<RoutingA
         return deterministicAdvisory(input, "AI router disabled; deterministic fallback used");
     }
 
+    if (!hasConfiguredProvider()) {
+        warnOnce(
+            "ai_provider_not_configured",
+            "AI router is enabled but no provider is configured. Set BEDROCK_MODEL_ID or SAGEMAKER_ENDPOINT_NAME."
+        );
+        return deterministicAdvisory(
+            input,
+            "AI provider not configured; deterministic fallback used",
+            {
+                enabled: false,
+                rejectedReason: "provider_not_configured",
+            }
+        );
+    }
+
     let providerResult: ProviderAdvisory | undefined;
 
     if (AI_ROUTER_PROVIDER === "bedrock" || AI_ROUTER_PROVIDER === "auto") {
@@ -360,11 +421,14 @@ export async function getRoutingAdvisory(input: AdvisoryInput): Promise<RoutingA
     }
 
     if (!providerResult) {
-        const fallback = deterministicAdvisory(input, "AI provider unavailable; deterministic fallback used");
-        return {
-            ...fallback,
-            enabled: true,
-        };
+        return deterministicAdvisory(
+            input,
+            "AI provider invocation failed; deterministic fallback used",
+            {
+                enabled: true,
+                rejectedReason: "provider_invocation_failed",
+            }
+        );
     }
 
     const guardrailResult = runGuardrails(input, providerResult);

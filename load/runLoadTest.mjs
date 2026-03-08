@@ -2,6 +2,7 @@
 
 import process from "node:process";
 import { performance } from "node:perf_hooks";
+import fs from "node:fs";
 
 function percentile(sorted, p) {
   if (sorted.length === 0) return 0;
@@ -17,11 +18,13 @@ function parseNumber(value, fallback) {
 const BASE_URL = process.env.LOAD_BASE_URL;
 const PATH = process.env.LOAD_PATH ?? "/health";
 const DURATION_SECONDS = parseNumber(process.env.LOAD_DURATION_SECONDS, 30);
+const WARMUP_SECONDS = Math.max(0, parseNumber(process.env.LOAD_WARMUP_SECONDS, 0));
 const CONCURRENCY = Math.max(1, Math.floor(parseNumber(process.env.LOAD_CONCURRENCY, 20)));
 const TIMEOUT_MS = Math.max(250, Math.floor(parseNumber(process.env.LOAD_TIMEOUT_MS, 5000)));
 const MAX_ERROR_RATE = parseNumber(process.env.LOAD_MAX_ERROR_RATE, 0.01);
 const MAX_P95_MS = parseNumber(process.env.LOAD_MAX_P95_MS, 800);
 const MAX_P99_MS = parseNumber(process.env.LOAD_MAX_P99_MS, 1200);
+const REPORT_FILE = process.env.LOAD_REPORT_FILE?.trim() || "";
 
 if (!BASE_URL) {
   console.error("LOAD_BASE_URL is required (example: https://api.example.com/prod)");
@@ -39,6 +42,7 @@ let failed = 0;
 let timeoutFailures = 0;
 const statusCounts = new Map();
 const startedAt = performance.now();
+const measurementStartAt = startedAt + WARMUP_SECONDS * 1000;
 const endAt = startedAt + DURATION_SECONDS * 1000;
 
 async function singleRequest() {
@@ -56,23 +60,33 @@ async function singleRequest() {
     });
 
     const elapsed = performance.now() - start;
-    latencies.push(elapsed);
-    total += 1;
-
-    if (response.ok) {
-      success += 1;
-    } else {
-      failed += 1;
+    const now = performance.now();
+    if (now >= measurementStartAt) {
+      latencies.push(elapsed);
+      total += 1;
     }
-    const statusKey = String(response.status);
-    statusCounts.set(statusKey, (statusCounts.get(statusKey) ?? 0) + 1);
+
+    if (now >= measurementStartAt) {
+      if (response.ok) {
+        success += 1;
+      } else {
+        failed += 1;
+      }
+    }
+    if (now >= measurementStartAt) {
+      const statusKey = String(response.status);
+      statusCounts.set(statusKey, (statusCounts.get(statusKey) ?? 0) + 1);
+    }
   } catch (error) {
     const elapsed = performance.now() - start;
-    latencies.push(elapsed);
-    total += 1;
-    failed += 1;
-    if (error instanceof Error && error.name === "AbortError") {
-      timeoutFailures += 1;
+    const now = performance.now();
+    if (now >= measurementStartAt) {
+      latencies.push(elapsed);
+      total += 1;
+      failed += 1;
+      if (error instanceof Error && error.name === "AbortError") {
+        timeoutFailures += 1;
+      }
     }
   } finally {
     clearTimeout(timeout);
@@ -98,6 +112,7 @@ const rps = totalDurationMs > 0 ? (total / totalDurationMs) * 1000 : 0;
 
 const report = {
   targetUrl,
+  warmupSeconds: WARMUP_SECONDS,
   durationSeconds: DURATION_SECONDS,
   concurrency: CONCURRENCY,
   timeoutMs: TIMEOUT_MS,
@@ -124,6 +139,11 @@ const report = {
 };
 
 console.log(JSON.stringify(report, null, 2));
+
+if (REPORT_FILE) {
+  fs.writeFileSync(REPORT_FILE, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  console.log(`Load report written to ${REPORT_FILE}`);
+}
 
 const budgetFailures = [];
 if (errorRate > MAX_ERROR_RATE) {

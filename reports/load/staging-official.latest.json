@@ -1,0 +1,29 @@
+{
+  "targetUrl": "https://89rornylmd.execute-api.us-east-1.amazonaws.com/prod/health",
+  "warmupSeconds": 10,
+  "durationSeconds": 30,
+  "concurrency": 4,
+  "timeoutMs": 5000,
+  "totals": {
+    "total": 218,
+    "success": 218,
+    "failed": 0,
+    "timeoutFailures": 0,
+    "statusCounts": {
+      "200": 218
+    }
+  },
+  "latencyMs": {
+    "p50": 339.15,
+    "p95": 614.62,
+    "p99": 725.21
+  },
+  "throughput": {
+    "requestsPerSecond": 7.2
+  },
+  "budgets": {
+    "maxErrorRate": 0.05,
+    "maxP95Ms": 800,
+    "maxP99Ms": 1500
+  }
+}

@@ -7,6 +7,7 @@ import {
     DynamoDBDocumentClient,
     GetCommand,
     PutCommand,
+    ScanCommand,
     UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 
@@ -29,6 +30,7 @@ type UserOperationRecord = {
 };
 
 type SwapHistoryRecord = {
+    swapId?: string;
     chain: string;
     tokenIn: string;
     tokenOut: string;
@@ -36,6 +38,7 @@ type SwapHistoryRecord = {
     minAmountOut: string;
     to: string;
     status?: string;
+    createdAt?: string;
     ttl?: number;
 };
 
@@ -60,18 +63,35 @@ type TopupIdempotencyRecord = {
     updatedAt: string;
 };
 
+export type AiTelemetryRecord = {
+    telemetryId: string;
+    experimentId: string;
+    variant: "control" | "treatment";
+    endpoint: string;
+    requestedChain: string;
+    recommendedChain: string;
+    measurableGain: boolean;
+    estimatedGainBps: number;
+    modelSource: string;
+    chain: string;
+    createdAt: string;
+    ttl: number;
+};
+
 export class PersistenceService {
     private readonly userOperationsTable?: string;
     private readonly swapHistoryTable?: string;
     private readonly walletActivationsTable?: string;
+    private readonly aiTelemetryTable?: string;
     private readonly docClient?: DynamoDBDocumentClient;
 
     constructor() {
         this.userOperationsTable = process.env.USER_OPERATIONS_TABLE;
         this.swapHistoryTable = process.env.SWAP_HISTORY_TABLE;
         this.walletActivationsTable = process.env.WALLET_ACTIVATIONS_TABLE;
+        this.aiTelemetryTable = process.env.AI_TELEMETRY_TABLE;
 
-        if (this.userOperationsTable || this.swapHistoryTable || this.walletActivationsTable) {
+        if (this.userOperationsTable || this.swapHistoryTable || this.walletActivationsTable || this.aiTelemetryTable) {
             const client = new DynamoDBClient({ region: process.env.AWS_REGION });
             this.docClient = DynamoDBDocumentClient.from(client);
         }
@@ -342,5 +362,149 @@ export class PersistenceService {
                 },
             })
         );
+    }
+
+    async listRecentSwapBuilds(options?: {
+        sinceIso?: string;
+        limit?: number;
+    }): Promise<SwapHistoryRecord[]> {
+        if (!this.docClient || !this.swapHistoryTable) {
+            return [];
+        }
+
+        try {
+            const response = await this.docClient.send(
+                new ScanCommand({
+                    TableName: this.swapHistoryTable,
+                    ...(options?.sinceIso
+                        ? {
+                            FilterExpression: "#createdAt >= :sinceIso",
+                            ExpressionAttributeNames: { "#createdAt": "createdAt" },
+                            ExpressionAttributeValues: { ":sinceIso": options.sinceIso },
+                        }
+                        : {}),
+                    Limit: options?.limit ?? 500,
+                })
+            );
+
+            const items = (response.Items ?? []) as SwapHistoryRecord[];
+            return items.sort((a, b) => {
+                const aTime = a.createdAt ? Date.parse(a.createdAt) : 0;
+                const bTime = b.createdAt ? Date.parse(b.createdAt) : 0;
+                return bTime - aTime;
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (message.includes("not authorized to perform: dynamodb:Scan")) {
+                console.warn("WARN: Swap dashboard scan is not permitted by IAM; returning empty dashboard dataset.");
+                return [];
+            }
+            throw error;
+        }
+    }
+
+    async recordAiTelemetry(input: {
+        experimentId: string;
+        variant: "control" | "treatment";
+        endpoint: string;
+        requestedChain: string;
+        recommendedChain: string;
+        measurableGain: boolean;
+        estimatedGainBps: number;
+        modelSource: string;
+        chain: string;
+        subjectKey: string;
+    }): Promise<string | null> {
+        if (!this.docClient || !this.aiTelemetryTable) {
+            return null;
+        }
+
+        const createdAt = new Date().toISOString();
+        const telemetryId = createHash("sha256")
+            .update(
+                JSON.stringify({
+                    experimentId: input.experimentId,
+                    variant: input.variant,
+                    endpoint: input.endpoint,
+                    requestedChain: input.requestedChain,
+                    recommendedChain: input.recommendedChain,
+                    measurableGain: input.measurableGain,
+                    estimatedGainBps: input.estimatedGainBps,
+                    modelSource: input.modelSource,
+                    chain: input.chain,
+                    subjectKey: input.subjectKey,
+                    createdAt,
+                })
+            )
+            .digest("hex");
+
+        try {
+            await this.docClient.send(
+                new PutCommand({
+                    TableName: this.aiTelemetryTable,
+                    Item: {
+                        telemetryId,
+                        experimentId: input.experimentId,
+                        variant: input.variant,
+                        endpoint: input.endpoint,
+                        requestedChain: input.requestedChain,
+                        recommendedChain: input.recommendedChain,
+                        measurableGain: input.measurableGain,
+                        estimatedGainBps: input.estimatedGainBps,
+                        modelSource: input.modelSource,
+                        chain: input.chain,
+                        createdAt,
+                        ttl: this.computeTtl(),
+                    },
+                    ConditionExpression: "attribute_not_exists(telemetryId)",
+                })
+            );
+            return telemetryId;
+        } catch (error) {
+            if (error instanceof ConditionalCheckFailedException) {
+                return telemetryId;
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            if (message.includes("not authorized to perform")) {
+                console.warn("WARN: AI telemetry write is not permitted by IAM; skipping telemetry persistence.");
+                return null;
+            }
+            throw error;
+        }
+    }
+
+    async listRecentAiTelemetry(options?: {
+        sinceIso?: string;
+        limit?: number;
+    }): Promise<AiTelemetryRecord[]> {
+        if (!this.docClient || !this.aiTelemetryTable) {
+            return [];
+        }
+
+        try {
+            const response = await this.docClient.send(
+                new ScanCommand({
+                    TableName: this.aiTelemetryTable,
+                    ...(options?.sinceIso
+                        ? {
+                            FilterExpression: "#createdAt >= :sinceIso",
+                            ExpressionAttributeNames: { "#createdAt": "createdAt" },
+                            ExpressionAttributeValues: { ":sinceIso": options.sinceIso },
+                        }
+                        : {}),
+                    Limit: options?.limit ?? 1000,
+                })
+            );
+
+            const items = (response.Items ?? []) as AiTelemetryRecord[];
+            return items.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (message.includes("not authorized to perform: dynamodb:Scan")) {
+                console.warn("WARN: AI telemetry scan is not permitted by IAM; returning empty telemetry dataset.");
+                return [];
+            }
+            throw error;
+        }
     }
 }

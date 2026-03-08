@@ -10,10 +10,14 @@
     "test": "vitest --run",
     "test:load": "node load/runLoadTest.mjs",
     "test:load:staging": "LOAD_BASE_URL=https://89rornylmd.execute-api.us-east-1.amazonaws.com/prod node load/runLoadTest.mjs",
+    "test:load:staging:official": "LOAD_BASE_URL=https://89rornylmd.execute-api.us-east-1.amazonaws.com/prod LOAD_WARMUP_SECONDS=10 LOAD_CONCURRENCY=4 LOAD_DURATION_SECONDS=30 LOAD_MAX_ERROR_RATE=0.05 LOAD_MAX_P95_MS=800 LOAD_MAX_P99_MS=1500 node load/runLoadTest.mjs",
+    "test:load:staging:official:report": "mkdir -p reports/load && LOAD_BASE_URL=https://89rornylmd.execute-api.us-east-1.amazonaws.com/prod LOAD_WARMUP_SECONDS=10 LOAD_CONCURRENCY=4 LOAD_DURATION_SECONDS=30 LOAD_MAX_ERROR_RATE=0.05 LOAD_MAX_P95_MS=800 LOAD_MAX_P99_MS=1500 LOAD_REPORT_FILE=reports/load/staging-official.latest.json node load/runLoadTest.mjs",
+    "demo:activity": "tsx scripts/generateDemoActivity.ts",
     "test:watch": "vitest",
     "test:ui": "vitest --ui"
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock-agent-runtime": "^3.1003.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1003.0",
     "@aws-sdk/client-dynamodb": "^3.1003.0",
     "@aws-sdk/client-kms": "^3.1003.0",

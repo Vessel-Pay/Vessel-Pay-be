@@ -28,6 +28,12 @@ import {
   publishWalletActivated,
 } from "./services/eventPublisher.js";
 import { getRoutingAdvisory, type RoutingAdvisory } from "./services/aiRouter.js";
+import { assessPaymasterRisk, generateRiskExplanation } from "./services/riskScoring.js";
+import { buildCopilotActionPlan } from "./services/paymentCopilot.js";
+import { assignAiExperimentVariant, computeSwapIntelligenceSummary } from "./services/aiSwapIntelligence.js";
+import { isAgentCoreConfigured, runAgentCore } from "./services/agentCore.js";
+import { generateKiroPlan } from "./services/kiroPlanner.js";
+import { isSagemakerInferenceConfigured, runSagemakerInference } from "./services/sagemakerInference.js";
 
 dotenv.config();
 
@@ -65,6 +71,16 @@ function getClientIdentifier(req: express.Request): string {
     return forwardedFor.split(",")[0].trim();
   }
   return req.ip || "unknown";
+}
+
+function buildAiTelemetrySubject(input: {
+  clientId: string;
+  tokenIn: string;
+  tokenOut: string;
+  amountIn: string;
+  chain: string;
+}): string {
+  return `${input.clientId}:${input.chain}:${input.tokenIn.toLowerCase()}:${input.tokenOut.toLowerCase()}:${input.amountIn}`;
 }
 
 function createRateLimiter(options: { scope: string; maxPerMinute: number }): express.RequestHandler {
@@ -137,6 +153,8 @@ function requireScopedApiKey(requiredKey?: string): express.RequestHandler {
 
 const requireSignApiKey = requireScopedApiKey(EDGE_SIGN_API_KEY);
 const requireTopupApiKey = requireScopedApiKey(EDGE_TOPUP_API_KEY);
+
+const RISK_BLOCK_LEVEL = (process.env.RISK_BLOCK_LEVEL ?? "high").toLowerCase();
 
 // Middleware
 app.use(express.json());
@@ -745,6 +763,304 @@ app.get("/signer", (_, res) => {
   });
 });
 
+app.post("/risk/assess", async (req, res) => {
+  try {
+    const payerAddress = requireAddress(req.body?.payerAddress, "payerAddress");
+    const tokenAddress = requireAddress(req.body?.tokenAddress, "tokenAddress");
+    const isActivation = Boolean(req.body?.isActivation);
+    const chainContext = getChainContext(req);
+
+    const risk = assessPaymasterRisk({
+      payerAddress,
+      tokenAddress,
+      isActivation,
+      chain: chainContext.chain.key,
+      clientId: getClientIdentifier(req),
+    });
+
+    const explanation = await generateRiskExplanation({
+      assessment: risk,
+      context: {
+        payerAddress,
+        tokenAddress,
+        chain: chainContext.chain.key,
+        isActivation,
+      },
+    });
+
+    res.json({
+      chain: chainContext.chain.key,
+      chainId: chainContext.chain.chainId,
+      risk,
+      explanation,
+    });
+  } catch (error) {
+    res.status(400).json({
+      error: "risk_assessment_failed",
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+app.post("/ai/copilot", async (req, res) => {
+  try {
+    const promptRaw = req.body?.prompt;
+    const prompt = typeof promptRaw === "string" ? promptRaw.trim() : "";
+    if (!prompt) {
+      return res.status(400).json({
+        error: "missing_prompt",
+        message: "prompt is required",
+      });
+    }
+
+    const plan = await buildCopilotActionPlan(prompt);
+    return res.json({
+      ok: true,
+      plan,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      error: "copilot_failed",
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+app.post("/ai/agentcore/session", async (req, res) => {
+  try {
+    const inputTextRaw = req.body?.inputText;
+    const inputText = typeof inputTextRaw === "string" ? inputTextRaw.trim() : "";
+    if (!inputText) {
+      return res.status(400).json({
+        error: "missing_input_text",
+        message: "inputText is required",
+      });
+    }
+
+    const sessionIdRaw = req.body?.sessionId;
+    const userIdRaw = req.body?.userId;
+
+    if (!isAgentCoreConfigured()) {
+      const fallbackPlan = await buildCopilotActionPlan(inputText);
+      const fallbackSessionId =
+        typeof sessionIdRaw === "string" && sessionIdRaw.trim() !== ""
+          ? sessionIdRaw.trim()
+          : `agentcore-fallback-${Date.now()}`;
+
+      return res.json({
+        ok: true,
+        provider: "bedrock-agentcore-fallback",
+        configured: false,
+        result: {
+          sessionId: fallbackSessionId,
+          outputText: fallbackPlan.summary,
+        },
+        fallbackPlan,
+      });
+    }
+
+    const result = await runAgentCore({
+      inputText,
+      sessionId: typeof sessionIdRaw === "string" ? sessionIdRaw : undefined,
+      userId: typeof userIdRaw === "string" ? userIdRaw : undefined,
+    });
+
+    return res.json({
+      ok: true,
+      provider: "bedrock-agentcore",
+      result,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      error: "agentcore_failed",
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+app.post("/ai/kiro/plan", async (req, res) => {
+  try {
+    const goalRaw = req.body?.goal;
+    const goal = typeof goalRaw === "string" ? goalRaw.trim() : "";
+    if (!goal) {
+      return res.status(400).json({
+        error: "missing_goal",
+        message: "goal is required",
+      });
+    }
+
+    const contextRaw = req.body?.context;
+    const context =
+      contextRaw && typeof contextRaw === "object" && !Array.isArray(contextRaw)
+        ? (contextRaw as Record<string, unknown>)
+        : undefined;
+
+    const plan = await generateKiroPlan({
+      goal,
+      context,
+    });
+
+    return res.json({
+      ok: true,
+      plan,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      error: "kiro_plan_failed",
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+app.post("/ai/sagemaker/infer", async (req, res) => {
+  try {
+    const endpointNameRaw = req.body?.endpointName;
+    const endpointName =
+      typeof endpointNameRaw === "string" ? endpointNameRaw : undefined;
+
+    if (!isSagemakerInferenceConfigured(endpointName)) {
+      return res.json({
+        ok: true,
+        provider: "sagemaker-runtime-fallback",
+        configured: false,
+        inference: {
+          endpointName: endpointName ?? process.env.SAGEMAKER_ENDPOINT_NAME ?? "",
+          contentType:
+            typeof req.body?.contentType === "string" ? req.body.contentType : "application/json",
+          response: {
+            fallback: true,
+            recommendedChain: "base_sepolia",
+            confidence: 0.5,
+            reason: "SAGEMAKER_ENDPOINT_NAME is not configured; deterministic fallback response returned.",
+          },
+        },
+      });
+    }
+
+    const inference = await runSagemakerInference({
+      payload: req.body?.payload,
+      endpointName,
+      contentType:
+        typeof req.body?.contentType === "string" ? req.body.contentType : undefined,
+    });
+
+    return res.json({
+      ok: true,
+      provider: "sagemaker-runtime",
+      inference,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      error: "sagemaker_inference_failed",
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+app.get("/ai/merchant/dashboard", async (req, res) => {
+  try {
+    const requestedWindowDays = Number.parseInt(String(req.query?.windowDays ?? "30"), 10);
+    const windowDays = Number.isFinite(requestedWindowDays)
+      ? Math.max(1, Math.min(90, requestedWindowDays))
+      : 30;
+
+    const sinceDate = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+    const swaps = await persistence.listRecentSwapBuilds({
+      sinceIso: sinceDate.toISOString(),
+      limit: 1000,
+    });
+    const telemetry = await persistence.listRecentAiTelemetry({
+      sinceIso: sinceDate.toISOString(),
+      limit: 2000,
+    });
+
+    const totalSwaps = swaps.length;
+    const chainDistribution = swaps.reduce<Record<string, number>>((acc, item) => {
+      acc[item.chain] = (acc[item.chain] ?? 0) + 1;
+      return acc;
+    }, {});
+
+    const pairDistribution = swaps.reduce<Record<string, number>>((acc, item) => {
+      const pair = `${item.tokenIn.toLowerCase()}->${item.tokenOut.toLowerCase()}`;
+      acc[pair] = (acc[pair] ?? 0) + 1;
+      return acc;
+    }, {});
+
+    const totalVolumeIn = swaps.reduce((sum, item) => {
+      try {
+        return sum + BigInt(item.amountIn);
+      } catch {
+        return sum;
+      }
+    }, 0n);
+
+    const daily = new Map<string, number>();
+    for (const item of swaps) {
+      const key = (item.createdAt ?? new Date().toISOString()).slice(0, 10);
+      daily.set(key, (daily.get(key) ?? 0) + 1);
+    }
+
+    const dailySeries = [...daily.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, count]) => ({ date, count }));
+
+    const avgDaily = dailySeries.length > 0
+      ? dailySeries.reduce((sum, item) => sum + item.count, 0) / dailySeries.length
+      : 0;
+
+    const projectedNext7Days = Math.round(avgDaily * 7);
+
+    const topPairs = Object.entries(pairDistribution)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([pair, count]) => ({ pair, count }));
+
+    const control = telemetry.filter((item) => item.variant === "control");
+    const treatment = telemetry.filter((item) => item.variant === "treatment");
+    const avg = (values: number[]) =>
+      values.length === 0 ? 0 : values.reduce((sum, value) => sum + value, 0) / values.length;
+
+    const controlAvgGainBps = avg(control.map((item) => item.estimatedGainBps));
+    const treatmentAvgGainBps = avg(treatment.map((item) => item.estimatedGainBps));
+    const measurableGainRate =
+      telemetry.length === 0
+        ? 0
+        : telemetry.filter((item) => item.measurableGain).length / telemetry.length;
+
+    res.json({
+      windowDays,
+      generatedAt: new Date().toISOString(),
+      kpis: {
+        totalSwaps,
+        totalVolumeIn: totalVolumeIn.toString(),
+        avgDailySwaps: Number(avgDaily.toFixed(2)),
+        projectedNext7Days,
+      },
+      abExperiment: {
+        totalSamples: telemetry.length,
+        controlSamples: control.length,
+        treatmentSamples: treatment.length,
+        controlAvgGainBps: Number(controlAvgGainBps.toFixed(2)),
+        treatmentAvgGainBps: Number(treatmentAvgGainBps.toFixed(2)),
+        liftBps: Number((treatmentAvgGainBps - controlAvgGainBps).toFixed(2)),
+        measurableGainRate: Number((measurableGainRate * 100).toFixed(2)),
+      },
+      chainDistribution,
+      topPairs,
+      dailySeries,
+      insight:
+        totalSwaps === 0
+          ? "No swap telemetry yet for this window. Trigger swap/build flows to unlock AI forecasting."
+          : `Projected ~${projectedNext7Days} swap builds in the next 7 days. A/B telemetry samples: ${telemetry.length}.`,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "merchant_dashboard_failed",
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
 /**
  * POST /sign - Sign paymaster data
  *
@@ -816,6 +1132,43 @@ app.post("/sign", requireSignApiKey, signRateLimiter, async (req, res) => {
     assertSignValidityWindow(resolvedValidAfter, resolvedValidUntil);
 
     const resolvedIsActivation = Boolean(isActivation);
+
+    const riskAssessment = assessPaymasterRisk({
+      payerAddress: normalizedPayerAddress,
+      tokenAddress: normalizedTokenAddress,
+      isActivation: resolvedIsActivation,
+      chain: chainContext.chain.key,
+      clientId: getClientIdentifier(req),
+    });
+
+    const riskExplanation = await generateRiskExplanation({
+      assessment: riskAssessment,
+      context: {
+        payerAddress: normalizedPayerAddress,
+        tokenAddress: normalizedTokenAddress,
+        chain: chainContext.chain.key,
+        isActivation: resolvedIsActivation,
+      },
+    });
+
+    const shouldBlockRisk =
+      (RISK_BLOCK_LEVEL === "critical" && riskAssessment.level === "critical") ||
+      (RISK_BLOCK_LEVEL === "high" && (riskAssessment.level === "high" || riskAssessment.level === "critical"));
+
+    if (shouldBlockRisk) {
+      emitCountMetric("PaymasterRiskBlocked", 1, {
+        endpoint: "/sign",
+        level: riskAssessment.level,
+      });
+
+      return res.status(403).json({
+        error: "risk_blocked",
+        message: "Request blocked by AI risk policy",
+        risk: riskAssessment,
+        riskExplanation,
+      });
+    }
+
     const idempotencyKeyHeader = req.headers["idempotency-key"];
     const idempotencyKey =
       typeof idempotencyKeyHeader === "string" && idempotencyKeyHeader.trim() !== ""
@@ -873,6 +1226,8 @@ app.post("/sign", requireSignApiKey, signRateLimiter, async (req, res) => {
           signature: existingOperation.signature,
           operationHash,
           replayed: true,
+          risk: riskAssessment,
+          riskExplanation,
         });
       }
     }
@@ -918,7 +1273,7 @@ app.post("/sign", requireSignApiKey, signRateLimiter, async (req, res) => {
       chainId: String(chainContext.chain.chainId),
     });
 
-    res.json({ signature, operationHash });
+    res.json({ signature, operationHash, risk: riskAssessment, riskExplanation });
   } catch (error) {
     if (isValidationError(error)) {
       emitCountMetric("PaymasterSignFailure", 1, { endpoint: "/sign" });
@@ -1009,6 +1364,34 @@ app.get("/swap/quote", async (req, res) => {
       quotesByChain,
     });
 
+    const aiIntelligence = computeSwapIntelligenceSummary({
+      requestedChain: chain.key,
+      advisory: aiAdvisory,
+      quotesByChain,
+    });
+
+    const telemetrySubject = buildAiTelemetrySubject({
+      clientId: getClientIdentifier(req),
+      tokenIn,
+      tokenOut,
+      amountIn: amountIn.toString(),
+      chain: chain.key,
+    });
+    const assignment = assignAiExperimentVariant(telemetrySubject);
+
+    void persistence.recordAiTelemetry({
+      experimentId: assignment.experimentId,
+      variant: assignment.variant,
+      endpoint: "/swap/quote",
+      requestedChain: chain.key,
+      recommendedChain: aiIntelligence.recommendedChain,
+      measurableGain: aiIntelligence.measurableGain,
+      estimatedGainBps: aiIntelligence.estimatedGainBps,
+      modelSource: aiIntelligence.modelSource,
+      chain: chain.key,
+      subjectKey: assignment.subject,
+    });
+
     logger.info({
       requestId: requestContext.requestId,
       endpoint: "/swap/quote",
@@ -1044,6 +1427,11 @@ app.get("/swap/quote", async (req, res) => {
       fee: quote.fee.toString(),
       totalUserPays: quote.totalUserPays.toString(),
       aiAdvisory,
+      aiIntelligence,
+      aiExperiment: {
+        experimentId: assignment.experimentId,
+        variant: assignment.variant,
+      },
     });
   } catch (error) {
     emitCountMetric("SwapQuoteFailure", 1, { endpoint: "/swap/quote" });
@@ -1092,24 +1480,30 @@ app.post("/swap/build", async (req, res) => {
       rejectedReason: "auto_route_disabled",
       estimatedFeeBps: undefined as number | undefined,
     };
+    let aiIntelligence = computeSwapIntelligenceSummary({
+      requestedChain: requestedContext.chain.key,
+      advisory: aiAdvisory,
+      quotesByChain: {},
+    });
 
     let effectiveContext = requestedContext;
 
+    const availableChainKeys = (Object.values(CHAINS)
+      .filter((item) => item.rpcUrl && item.stableSwapAddress)
+      .map((item) => item.key)) as ChainKey[];
+
+    const quotePairs = await Promise.all(
+      availableChainKeys.map(async (chainKey) => [
+        chainKey,
+        await getSwapQuoteForChain(chainKey, tokenIn, tokenOut, amountIn),
+      ] as const)
+    );
+
+    const quotesByChain = Object.fromEntries(
+      quotePairs.filter((pair) => pair[1] !== undefined)
+    ) as Partial<Record<ChainKey, { amountOut: string; fee: string; totalUserPays: string }>>;
+
     if (autoRoute) {
-      const availableChainKeys = (Object.values(CHAINS)
-        .filter((item) => item.rpcUrl && item.stableSwapAddress)
-        .map((item) => item.key)) as ChainKey[];
-
-      const quotePairs = await Promise.all(
-        availableChainKeys.map(async (chainKey) => [
-          chainKey,
-          await getSwapQuoteForChain(chainKey, tokenIn, tokenOut, amountIn),
-        ] as const)
-      );
-
-      const quotesByChain = Object.fromEntries(
-        quotePairs.filter((pair) => pair[1] !== undefined)
-      ) as Partial<Record<ChainKey, { amountOut: string; fee: string; totalUserPays: string }>>;
 
       aiAdvisory = await getRoutingAdvisory({
         tokenIn,
@@ -1136,6 +1530,33 @@ app.post("/swap/build", async (req, res) => {
         throw new Error("minAmountOut exceeds deterministic on-chain quote");
       }
     }
+
+    aiIntelligence = computeSwapIntelligenceSummary({
+      requestedChain: requestedContext.chain.key,
+      advisory: aiAdvisory,
+      quotesByChain,
+    });
+
+    const telemetrySubject = buildAiTelemetrySubject({
+      clientId: getClientIdentifier(req),
+      tokenIn,
+      tokenOut,
+      amountIn: amountIn.toString(),
+      chain: requestedContext.chain.key,
+    });
+    const assignment = assignAiExperimentVariant(telemetrySubject);
+    void persistence.recordAiTelemetry({
+      experimentId: assignment.experimentId,
+      variant: assignment.variant,
+      endpoint: "/swap/build",
+      requestedChain: requestedContext.chain.key,
+      recommendedChain: aiIntelligence.recommendedChain,
+      measurableGain: aiIntelligence.measurableGain,
+      estimatedGainBps: aiIntelligence.estimatedGainBps,
+      modelSource: aiIntelligence.modelSource,
+      chain: effectiveContext.chain.key,
+      subjectKey: assignment.subject,
+    });
 
     const effectiveQuote = await readDeterministicSwapQuote(
       effectiveContext.publicClient,
@@ -1235,6 +1656,11 @@ app.post("/swap/build", async (req, res) => {
       minAmountOut: minAmountOut.toString(),
       autoRouteApplied: autoRoute && aiAdvisory.guardrailsPassed,
       aiAdvisory,
+      aiIntelligence,
+      aiExperiment: {
+        experimentId: assignment.experimentId,
+        variant: assignment.variant,
+      },
       note: "Use this calldata in your smart account / wallet tx",
     });
   } catch (error) {

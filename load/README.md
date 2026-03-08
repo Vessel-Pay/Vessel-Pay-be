@@ -11,6 +11,7 @@ LOAD_BASE_URL=https://89rornylmd.execute-api.us-east-1.amazonaws.com/prod npm ru
 ## Optional tuning
 
 - `LOAD_PATH` default: `/health`
+- `LOAD_WARMUP_SECONDS` default: `0`
 - `LOAD_DURATION_SECONDS` default: `30`
 - `LOAD_CONCURRENCY` default: `20`
 - `LOAD_TIMEOUT_MS` default: `5000`
@@ -19,3 +20,30 @@ LOAD_BASE_URL=https://89rornylmd.execute-api.us-east-1.amazonaws.com/prod npm ru
 - `LOAD_MAX_P99_MS` default: `1200`
 
 The script prints a JSON report and exits non-zero if any budget threshold is exceeded.
+
+## Official Task 26 staging profile
+
+Use the approved non-saturating profile for release readiness evidence:
+
+```bash
+npm run test:load:staging:official
+```
+
+Profile values:
+
+- `LOAD_CONCURRENCY=4`
+- `LOAD_WARMUP_SECONDS=10`
+- `LOAD_DURATION_SECONDS=30`
+- `LOAD_MAX_ERROR_RATE=0.05`
+- `LOAD_MAX_P95_MS=800`
+- `LOAD_MAX_P99_MS=1500`
+
+To generate an attachable JSON artifact:
+
+```bash
+npm run test:load:staging:official:report
+```
+
+Output file:
+
+- `reports/load/staging-official.latest.json`

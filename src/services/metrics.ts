@@ -9,6 +9,7 @@ type MetricName =
     | "TopupFailure"
     | "AiRouterRecommendationAccepted"
     | "AiRouterFallbackUsed"
+    | "PaymasterRiskBlocked"
     | "UserOperationSubmissionFailure";
 
 const DEFAULT_NAMESPACE = process.env.CLOUDWATCH_METRICS_NAMESPACE || "Vessel/API";
